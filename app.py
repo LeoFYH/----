@@ -408,7 +408,7 @@ def render_form(message: str = "") -> bytes:
 <div class="top-grid">
 {render_saved_outputs()}
 <section class="panel">
-  <form action="/process" method="post" enctype="multipart/form-data">
+  <form id="import_form" action="/process" method="post" enctype="multipart/form-data">
     <div>
       <label for="source_file">订单导出文件</label>
       <input id="source_file" name="source_file" type="file" accept=".xlsx" multiple required>
@@ -431,11 +431,67 @@ def render_form(message: str = "") -> bytes:
     </div>
     <div class="full actions">
       <button type="submit">生成清单</button>
-      <span class="hint">批量模式会按目标学校分别生成结果；默认不覆盖已有 sheet，会生成“导入”后缀。</span>
+      <button class="secondary" type="button" onclick="generateToFolder()">选择文件夹并生成</button>
+      <span class="hint">批量模式会按目标学校分别生成结果；公网 HTTP 不支持直接写入本机文件夹时，请用生成后的 ZIP 下载。</span>
     </div>
   </form>
 </section>
 </div>"""
+    body += """
+<script>
+async function writeServerFileToDirectory(directoryHandle, fileName) {
+  const response = await fetch("/download/" + encodeURIComponent(fileName));
+  if (!response.ok) {
+    throw new Error("下载失败：" + fileName);
+  }
+  const blob = await response.blob();
+  const fileHandle = await directoryHandle.getFileHandle(fileName, { create: true });
+  const writable = await fileHandle.createWritable();
+  await writable.write(blob);
+  await writable.close();
+}
+
+async function generateToFolder() {
+  const form = document.getElementById("import_form");
+  if (!form.reportValidity()) return;
+  if (!window.showDirectoryPicker) {
+    alert("当前浏览器或访问方式不支持直接选择文件夹。请使用 HTTPS 域名访问，或点击“生成清单”后下载 ZIP。");
+    return;
+  }
+
+  let directoryHandle;
+  try {
+    directoryHandle = await window.showDirectoryPicker({ mode: "readwrite" });
+  } catch (_error) {
+    return;
+  }
+
+  const button = document.querySelector('button[onclick="generateToFolder()"]');
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = "生成并保存中...";
+
+  try {
+    const data = new FormData(form);
+    data.append("response_mode", "json");
+    const response = await fetch("/process", { method: "POST", body: data });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || "生成失败。");
+    }
+    for (const file of payload.files) {
+      await writeServerFileToDirectory(directoryHandle, file.name);
+    }
+    alert("保存完成，共生成 " + payload.files.length + " 个目标学校清单。");
+    window.location.reload();
+  } catch (error) {
+    alert(error.message || String(error));
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+</script>"""
     return html_page("配送月清单导入工具", body)
 
 
@@ -1030,6 +1086,14 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+    def send_json(self, payload: dict[str, Any], status: int = 200) -> None:
+        content = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(content)))
+        self.end_headers()
+        self.wfile.write(content)
+
     def redirect_home(self) -> None:
         self.send_response(303)
         self.send_header("Location", "/")
@@ -1074,9 +1138,11 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
 
+        response_json = False
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             fields, files = parse_multipart(self.headers, self.rfile.read(content_length))
+            response_json = fields.get("response_mode") == "json" or "application/json" in self.headers.get("Accept", "")
             source_uploads = files.get("source_file", [])
             template_uploads = files.get("template_file", [])
             if not source_uploads or not template_uploads:
@@ -1140,12 +1206,32 @@ class AppHandler(BaseHTTPRequestHandler):
 
             zip_name = f"配送月清单_批量结果_{job_id}.zip"
             create_batch_zip([item.output_name for item in generated_workbooks], zip_name)
-            self.send_html(render_batch_result(generated_workbooks, errors, zip_name))
+            if response_json:
+                self.send_json(
+                    {
+                        "ok": True,
+                        "zip": zip_name,
+                        "errors": errors,
+                        "files": [
+                            {
+                                "name": item.output_name,
+                                "school": item.school,
+                                "template": item.template_name,
+                            }
+                            for item in generated_workbooks
+                        ],
+                    }
+                )
+            else:
+                self.send_html(render_batch_result(generated_workbooks, errors, zip_name))
         except Exception as exc:
             detail = str(exc)
             if not isinstance(exc, WorkbookProcessError):
                 detail = f"{detail}\n\n{traceback.format_exc(limit=3)}"
-            self.send_html(render_error(detail), status=400)
+            if response_json:
+                self.send_json({"ok": False, "error": detail}, status=400)
+            else:
+                self.send_html(render_error(detail), status=400)
 
 
 def run_server(host: str, port: int) -> None:
