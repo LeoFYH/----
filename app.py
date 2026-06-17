@@ -201,6 +201,55 @@ def html_page(title: str, body: str) -> bytes:
       background: #fff;
       color: var(--ink);
     }}
+    .danger {{
+      border-color: #b42318;
+      background: #b42318;
+      color: #fff;
+    }}
+    .top-grid {{
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 16px;
+    }}
+    .history-head {{
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 8px;
+    }}
+    .history-head h2 {{
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.3;
+    }}
+    .badge {{
+      display: inline-block;
+      border: 1px solid #b7c7d8;
+      border-radius: 999px;
+      padding: 1px 8px;
+      color: #164e63;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }}
+    .file-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .file-actions form {{
+      display: inline;
+    }}
+    .file-actions button, .file-actions .button {{
+      min-height: 32px;
+      padding: 0 10px;
+      font-size: 13px;
+    }}
+    .empty {{
+      color: var(--muted);
+      margin: 6px 0 0;
+    }}
     .message {{
       padding: 12px 14px;
       border-radius: 6px;
@@ -248,6 +297,7 @@ def html_page(title: str, body: str) -> bytes:
       form {{ grid-template-columns: 1fr; }}
       .actions {{ flex-direction: column; align-items: stretch; }}
       button, .button {{ width: 100%; }}
+      .file-actions {{ flex-direction: column; }}
     }}
   </style>
 </head>
@@ -266,9 +316,79 @@ def html_page(title: str, body: str) -> bytes:
     return page.encode("utf-8")
 
 
+def format_file_size(size: int) -> str:
+    if size < 1024:
+        return f"{size} B"
+    if size < 1024 * 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size / (1024 * 1024):.1f} MB"
+
+
+def list_saved_outputs() -> list[dict[str, Any]]:
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    files = []
+    for path in OUTPUT_DIR.glob("*.xlsx"):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        files.append(
+            {
+                "name": path.name,
+                "timestamp": stat.st_mtime,
+                "mtime": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                "size": format_file_size(stat.st_size),
+            }
+        )
+    return sorted(files, key=lambda item: item["timestamp"], reverse=True)
+
+
+def render_saved_outputs() -> str:
+    saved = list_saved_outputs()
+    if not saved:
+        return """
+<section class="panel">
+  <div class="history-head">
+    <h2>已保存的目标清单</h2>
+  </div>
+  <p class="empty">还没有生成过目标清单。</p>
+</section>"""
+
+    rows = []
+    for index, item in enumerate(saved):
+        name = item["name"]
+        latest = '<span class="badge">最新</span>' if index == 0 else ""
+        rows.append(
+            "<tr>"
+            f"<td>{latest}</td>"
+            f"<td>{html.escape(name)}</td>"
+            f"<td>{html.escape(item['mtime'])}</td>"
+            f"<td>{html.escape(item['size'])}</td>"
+            '<td><div class="file-actions">'
+            f'<a class="button secondary" href="/download/{quote(name)}">下载</a>'
+            f'<form action="/delete/{quote(name)}" method="post" onsubmit="return confirm(\'确定删除这个目标清单吗？删除后不能从工具中恢复。\');">'
+            '<button class="danger" type="submit">删除</button>'
+            "</form>"
+            "</div></td>"
+            "</tr>"
+        )
+    return f"""
+<section class="panel">
+  <div class="history-head">
+    <h2>已保存的目标清单</h2>
+    <span class="hint">除非删除，否则会一直保存在本机 outputs 文件夹。</span>
+  </div>
+  <table>
+    <thead><tr><th></th><th>文件名</th><th>更新时间</th><th>大小</th><th>操作</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</section>"""
+
+
 def render_form(message: str = "") -> bytes:
     escaped = f'<div class="message">{html.escape(message)}</div>' if message else ""
     body = f"""{escaped}
+<div class="top-grid">
+{render_saved_outputs()}
 <section class="panel">
   <form action="/process" method="post" enctype="multipart/form-data">
     <div>
@@ -296,7 +416,8 @@ def render_form(message: str = "") -> bytes:
       <span class="hint">默认不覆盖已有 sheet，会生成“导入”后缀。</span>
     </div>
   </form>
-</section>"""
+</section>
+</div>"""
     return html_page("配送月清单导入工具", body)
 
 
@@ -343,6 +464,15 @@ def render_error(error: str) -> bytes:
   <div class="actions"><a class="button secondary" href="/">返回重新上传</a></div>
 </section>"""
     return html_page("处理失败", body)
+
+
+def get_saved_output_path(name: str) -> Path:
+    safe_name = Path(name).name
+    path = (OUTPUT_DIR / safe_name).resolve()
+    output_root = OUTPUT_DIR.resolve()
+    if path.parent != output_root or path.suffix.lower() != ".xlsx":
+        raise WorkbookProcessError("只能操作已生成的 .xlsx 目标清单。")
+    return path
 
 
 def parse_multipart(headers: Any, body: bytes) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
@@ -779,6 +909,11 @@ class AppHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(content)
 
+    def redirect_home(self) -> None:
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
@@ -786,7 +921,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/download/"):
             name = Path(unquote(parsed.path.removeprefix("/download/"))).name
-            path = OUTPUT_DIR / name
+            path = get_saved_output_path(name)
             if not path.exists():
                 self.send_error(404, "文件不存在")
                 return
@@ -803,6 +938,17 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/delete/"):
+            try:
+                name = unquote(parsed.path.removeprefix("/delete/"))
+                path = get_saved_output_path(name)
+                if path.exists():
+                    path.unlink()
+                self.redirect_home()
+            except Exception as exc:
+                self.send_html(render_error(str(exc)), status=400)
+            return
+
         if parsed.path != "/process":
             self.send_error(404)
             return
