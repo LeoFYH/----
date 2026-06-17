@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import html
+import json
 import mimetypes
 import re
 import sys
 import traceback
 import uuid
+import zipfile
 from collections import defaultdict
 from copy import copy
 from dataclasses import dataclass
@@ -72,6 +74,15 @@ class GeneratedSheet:
     rows: int
     days: int
     total: Decimal
+
+
+@dataclass
+class GeneratedWorkbook:
+    output_name: str
+    school: str
+    template_name: str
+    sheets: list[GeneratedSheet]
+    warnings: list[str]
 
 
 class WorkbookProcessError(Exception):
@@ -324,6 +335,13 @@ def format_file_size(size: int) -> str:
     return f"{size / (1024 * 1024):.1f} MB"
 
 
+def safe_filename(value: str, fallback: str = "output") -> str:
+    text = clean_text(value) or fallback
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
+    text = re.sub(r"\s+", "_", text).strip("._ ")
+    return (text or fallback)[:80]
+
+
 def list_saved_outputs() -> list[dict[str, Any]]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     files = []
@@ -393,18 +411,18 @@ def render_form(message: str = "") -> bytes:
   <form action="/process" method="post" enctype="multipart/form-data">
     <div>
       <label for="source_file">订单导出文件</label>
-      <input id="source_file" name="source_file" type="file" accept=".xlsx" required>
-      <div class="hint">格式需包含：订单号、客户名称、发货日期、商品名称、实际数量等列。</div>
+      <input id="source_file" name="source_file" type="file" accept=".xlsx" multiple required>
+      <div class="hint">可一次选择多个订单导出文件；格式需包含：订单号、客户名称、发货日期、商品名称、实际数量等列。</div>
     </div>
     <div>
-      <label for="template_file">目标月清单模板</label>
-      <input id="template_file" name="template_file" type="file" accept=".xlsx" required>
-      <div class="hint">会从模板的“配送学校”单元格自动识别学校名。</div>
+      <label for="template_file">目标学校月清单模板</label>
+      <input id="template_file" name="template_file" type="file" accept=".xlsx" multiple required>
+      <div class="hint">可一次选择多个学校模板；每个模板会从“配送学校”单元格自动识别学校名并单独生成结果。</div>
     </div>
     <div class="full">
       <label for="school_name">学校名称（可选）</label>
       <input id="school_name" name="school_name" type="text" placeholder="不填则自动读取模板里的配送学校">
-      <div class="hint">如果源文件学校名和模板不完全一致，可以在这里手动填写源文件中的学校名。</div>
+      <div class="hint">仅单个目标模板时使用；如果源文件学校名和模板不完全一致，可以在这里手动填写源文件中的学校名。</div>
     </div>
     <div class="full checks">
       <label><input type="checkbox" name="include_regular" checked> 普通营养餐</label>
@@ -413,12 +431,102 @@ def render_form(message: str = "") -> bytes:
     </div>
     <div class="full actions">
       <button type="submit">生成清单</button>
-      <span class="hint">默认不覆盖已有 sheet，会生成“导入”后缀。</span>
+      <span class="hint">批量模式会按目标学校分别生成结果；默认不覆盖已有 sheet，会生成“导入”后缀。</span>
     </div>
   </form>
 </section>
 </div>"""
     return html_page("配送月清单导入工具", body)
+
+
+def create_batch_zip(output_names: list[str], zip_name: str) -> Path:
+    zip_path = OUTPUT_DIR / zip_name
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for output_name in output_names:
+            path = get_output_path(output_name, allowed_suffixes=(".xlsx",))
+            if path.exists():
+                archive.write(path, arcname=path.name)
+    return zip_path
+
+
+def render_batch_result(generated: list[GeneratedWorkbook], errors: list[str], zip_name: str | None) -> bytes:
+    rows = []
+    downloadable = []
+    for item in generated:
+        sheet_summary = "；".join(
+            f"{sheet.name} {sheet.rows}行 {format_decimal(sheet.total)}元"
+            for sheet in item.sheets
+        )
+        total_rows = sum(sheet.rows for sheet in item.sheets)
+        total_amount = sum((sheet.total for sheet in item.sheets), Decimal("0"))
+        downloadable.append(item.output_name)
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(item.school)}</td>"
+            f"<td>{html.escape(item.output_name)}</td>"
+            f"<td>{total_rows}</td>"
+            f"<td class=\"total\">{format_decimal(total_amount)}</td>"
+            f"<td>{html.escape(sheet_summary)}</td>"
+            '<td><div class="file-actions">'
+            f'<a class="button secondary" href="/download/{quote(item.output_name)}">下载</a>'
+            "</div></td>"
+            "</tr>"
+        )
+
+    warning_items = []
+    for item in generated:
+        for warning in item.warnings:
+            warning_items.append(f"{item.school}：{warning}")
+    warning_items.extend(errors)
+    warning_html = ""
+    if warning_items:
+        warning_html = "<div class=\"message\"><strong>提示</strong><ul>" + "".join(
+            f"<li>{html.escape(message)}</li>" for message in warning_items
+        ) + "</ul></div>"
+
+    zip_link = f'<a class="button" href="/download/{quote(zip_name)}">下载全部 ZIP</a>' if zip_name else ""
+    folder_button = ""
+    if downloadable:
+        files_json = html.escape(json.dumps(downloadable, ensure_ascii=False), quote=True)
+        folder_button = (
+            f'<button class="button secondary" type="button" onclick="saveBatchToFolder({files_json})">'
+            "选择文件夹保存</button>"
+        )
+
+    body = f"""
+<section class="panel">
+  <div class="message">已生成 <strong>{len(generated)}</strong> 个目标学校清单。</div>
+  {warning_html}
+  <div class="actions">
+    {zip_link}
+    {folder_button}
+    <a class="button secondary" href="/">继续处理</a>
+  </div>
+  <table>
+    <thead><tr><th>学校</th><th>结果文件</th><th>明细行</th><th>合计金额</th><th>sheet 明细</th><th>操作</th></tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</section>
+<script>
+async function saveBatchToFolder(files) {{
+  if (!window.showDirectoryPicker) {{
+    alert("当前浏览器或当前访问方式不支持直接选择文件夹。请使用“下载全部 ZIP”。");
+    return;
+  }}
+  const dir = await window.showDirectoryPicker();
+  for (const name of files) {{
+    const response = await fetch("/download/" + encodeURIComponent(name));
+    if (!response.ok) throw new Error("下载失败：" + name);
+    const blob = await response.blob();
+    const handle = await dir.getFileHandle(name, {{ create: true }});
+    const writable = await handle.createWritable();
+    await writable.write(blob);
+    await writable.close();
+  }}
+  alert("保存完成。");
+}}
+</script>"""
+    return html_page("生成完成", body)
 
 
 def render_result(output_name: str, school: str, sheets: list[GeneratedSheet], warnings: list[str]) -> bytes:
@@ -466,16 +574,21 @@ def render_error(error: str) -> bytes:
     return html_page("处理失败", body)
 
 
-def get_saved_output_path(name: str) -> Path:
+def get_output_path(name: str, allowed_suffixes: tuple[str, ...] = (".xlsx",)) -> Path:
     safe_name = Path(name).name
     path = (OUTPUT_DIR / safe_name).resolve()
     output_root = OUTPUT_DIR.resolve()
-    if path.parent != output_root or path.suffix.lower() != ".xlsx":
-        raise WorkbookProcessError("只能操作已生成的 .xlsx 目标清单。")
+    if path.parent != output_root or path.suffix.lower() not in allowed_suffixes:
+        allowed = "、".join(allowed_suffixes)
+        raise WorkbookProcessError(f"只能操作已生成的 {allowed} 文件。")
     return path
 
 
-def parse_multipart(headers: Any, body: bytes) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
+def get_saved_output_path(name: str) -> Path:
+    return get_output_path(name, allowed_suffixes=(".xlsx",))
+
+
+def parse_multipart(headers: Any, body: bytes) -> tuple[dict[str, str], dict[str, list[tuple[str, bytes]]]]:
     content_type = headers.get("Content-Type", "")
     raw = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8") + body
     message = BytesParser(policy=default).parsebytes(raw)
@@ -483,7 +596,7 @@ def parse_multipart(headers: Any, body: bytes) -> tuple[dict[str, str], dict[str
         raise WorkbookProcessError("上传请求格式不正确。")
 
     fields: dict[str, str] = {}
-    files: dict[str, tuple[str, bytes]] = {}
+    files: dict[str, list[tuple[str, bytes]]] = {}
     for part in message.iter_parts():
         disposition = part.get("Content-Disposition", "")
         if "form-data" not in disposition:
@@ -494,7 +607,7 @@ def parse_multipart(headers: Any, body: bytes) -> tuple[dict[str, str], dict[str
         if not name:
             continue
         if filename:
-            files[name] = (Path(filename).name, payload)
+            files.setdefault(name, []).append((Path(filename).name, payload))
         else:
             fields[name] = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
     return fields, files
@@ -641,6 +754,13 @@ def read_orders(path: Path, school_name: str, include_regular: bool, include_eve
         return sorted(orders, key=lambda item: (item.meal_type, item.delivery_date, item.order_no, item.row_no))
     finally:
         source_workbook.close()
+
+
+def read_orders_from_sources(source_paths: list[Path], school_name: str, include_regular: bool, include_evening: bool) -> list[OrderRow]:
+    orders: list[OrderRow] = []
+    for source_path in source_paths:
+        orders.extend(read_orders(source_path, school_name, include_regular, include_evening))
+    return sorted(orders, key=lambda item: (item.meal_type, item.delivery_date, item.order_no, item.row_no))
 
 
 def extract_school_name(workbook: Any) -> str:
@@ -849,7 +969,7 @@ def write_month_sheet(sheet: Worksheet, school_name: str, meal_type: str, year: 
 
 
 def process_workbook(
-    source_path: Path,
+    source_path: Path | list[Path],
     template_path: Path,
     output_path: Path,
     school_name: str | None = None,
@@ -859,11 +979,12 @@ def process_workbook(
 ) -> tuple[str, list[GeneratedSheet], list[str]]:
     target_workbook = load_workbook(template_path)
     try:
+        source_paths = source_path if isinstance(source_path, list) else [source_path]
         school = clean_text(school_name) or extract_school_name(target_workbook)
         if not school:
             raise WorkbookProcessError("学校名称为空。")
 
-        orders = read_orders(source_path, school, include_regular, include_evening)
+        orders = read_orders_from_sources(source_paths, school, include_regular, include_evening)
         if not orders:
             raise WorkbookProcessError(f"订单导出文件里没有匹配「{school}」或「{school}-早晚餐」的记录。")
 
@@ -921,7 +1042,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         if parsed.path.startswith("/download/"):
             name = Path(unquote(parsed.path.removeprefix("/download/"))).name
-            path = get_saved_output_path(name)
+            path = get_output_path(name, allowed_suffixes=(".xlsx", ".zip"))
             if not path.exists():
                 self.send_error(404, "文件不存在")
                 return
@@ -956,36 +1077,70 @@ class AppHandler(BaseHTTPRequestHandler):
         try:
             content_length = int(self.headers.get("Content-Length", "0"))
             fields, files = parse_multipart(self.headers, self.rfile.read(content_length))
-            if "source_file" not in files or "template_file" not in files:
+            source_uploads = files.get("source_file", [])
+            template_uploads = files.get("template_file", [])
+            if not source_uploads or not template_uploads:
                 raise WorkbookProcessError("请同时上传订单导出文件和目标模板文件。")
 
             UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-            source_name, source_bytes = files["source_file"]
-            template_name, template_bytes = files["template_file"]
-            if not source_name.lower().endswith(".xlsx") or not template_name.lower().endswith(".xlsx"):
-                raise WorkbookProcessError("当前工具只支持 .xlsx 文件。")
-
             job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
             job_dir = UPLOAD_DIR / job_id
             job_dir.mkdir(parents=True, exist_ok=True)
-            source_path = job_dir / source_name
-            template_path = job_dir / template_name
-            source_path.write_bytes(source_bytes)
-            template_path.write_bytes(template_bytes)
 
-            output_name = f"配送月清单_导入结果_{job_id}.xlsx"
-            output_path = OUTPUT_DIR / output_name
-            school, sheets, warnings = process_workbook(
-                source_path=source_path,
-                template_path=template_path,
-                output_path=output_path,
-                school_name=fields.get("school_name"),
-                include_regular="include_regular" in fields,
-                include_evening="include_evening" in fields,
-                replace_existing="replace_existing" in fields,
-            )
+            source_paths: list[Path] = []
+            for index, (source_name, source_bytes) in enumerate(source_uploads, start=1):
+                if not source_name.lower().endswith(".xlsx"):
+                    raise WorkbookProcessError("订单导出文件只支持 .xlsx。")
+                source_path = job_dir / f"订单_{index}_{safe_filename(source_name)}"
+                source_path.write_bytes(source_bytes)
+                source_paths.append(source_path)
 
-            self.send_html(render_result(output_name, school, sheets, warnings))
+            template_paths: list[tuple[str, Path]] = []
+            for index, (template_name, template_bytes) in enumerate(template_uploads, start=1):
+                if not template_name.lower().endswith(".xlsx"):
+                    raise WorkbookProcessError("目标模板文件只支持 .xlsx。")
+                template_path = job_dir / f"模板_{index}_{safe_filename(template_name)}"
+                template_path.write_bytes(template_bytes)
+                template_paths.append((template_name, template_path))
+
+            include_regular = "include_regular" in fields
+            include_evening = "include_evening" in fields
+            replace_existing = "replace_existing" in fields
+            manual_school = fields.get("school_name") if len(template_paths) == 1 else None
+
+            generated_workbooks: list[GeneratedWorkbook] = []
+            errors: list[str] = []
+            for index, (template_name, template_path) in enumerate(template_paths, start=1):
+                output_name = f"配送月清单_导入结果_{safe_filename(Path(template_name).stem, f'学校{index}')}_{index}_{job_id}.xlsx"
+                output_path = OUTPUT_DIR / output_name
+                try:
+                    school, sheets, warnings = process_workbook(
+                        source_path=source_paths,
+                        template_path=template_path,
+                        output_path=output_path,
+                        school_name=manual_school,
+                        include_regular=include_regular,
+                        include_evening=include_evening,
+                        replace_existing=replace_existing,
+                    )
+                    generated_workbooks.append(
+                        GeneratedWorkbook(
+                            output_name=output_name,
+                            school=school,
+                            template_name=template_name,
+                            sheets=sheets,
+                            warnings=warnings,
+                        )
+                    )
+                except Exception as exc:
+                    errors.append(f"{template_name}：{exc}")
+
+            if not generated_workbooks:
+                raise WorkbookProcessError("没有生成任何目标清单。\n" + "\n".join(errors))
+
+            zip_name = f"配送月清单_批量结果_{job_id}.zip"
+            create_batch_zip([item.output_name for item in generated_workbooks], zip_name)
+            self.send_html(render_batch_result(generated_workbooks, errors, zip_name))
         except Exception as exc:
             detail = str(exc)
             if not isinstance(exc, WorkbookProcessError):
