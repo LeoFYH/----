@@ -48,6 +48,16 @@ SOURCE_HEADERS = {
 }
 
 TABLE_HEADERS = ["发货时间", "商品名称", "商品描述", "实际数量", "单位", "单价（元）", "实际金额（元）", "日小计（元）"]
+TABLE_HEADER_ALIASES = [
+    {"发货时间", "发货日期", "配送日期"},
+    {"商品名称", "品名"},
+    {"商品描述", "规格", "规格型号"},
+    {"实际数量", "数量"},
+    {"单位", "发货单位"},
+    {"单价（元）", "单价", "发货单价", "发货单价（元）"},
+    {"实际金额（元）", "实际金额", "金额", "金额（元）"},
+    {"日小计（元）", "日小计", "小计", "小计（元）"},
+]
 
 
 @dataclass
@@ -677,6 +687,13 @@ def clean_text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def normalize_header_text(value: Any) -> str:
+    text = clean_text(value)
+    text = re.sub(r"\s+", "", text)
+    text = text.replace("(", "（").replace(")", "）")
+    return text
+
+
 def parse_date(value: Any) -> date | None:
     if isinstance(value, datetime):
         return value.date()
@@ -821,7 +838,14 @@ def read_orders_from_sources(source_paths: list[Path], school_name: str, include
 
 def extract_school_name(workbook: Any) -> str:
     pattern = re.compile(r"配送学校\s*[:：]\s*(.+)")
+    candidates: list[tuple[tuple[int, int, int], str]] = []
     for sheet in workbook.worksheets:
+        parsed_month = parse_sheet_month(sheet.title)
+        sort_key = (
+            parsed_month[0] if parsed_month else -1,
+            parsed_month[1] if parsed_month else -1,
+            workbook.worksheets.index(sheet),
+        )
         max_row = min(sheet.max_row or 1, 8)
         max_col = min(sheet.max_column or 1, 8)
         for row in sheet.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col):
@@ -829,7 +853,10 @@ def extract_school_name(workbook: Any) -> str:
                 value = clean_text(cell.value)
                 match = pattern.search(value)
                 if match:
-                    return match.group(1).strip()
+                    candidates.append((sort_key, match.group(1).strip()))
+    if candidates:
+        candidates.sort(key=lambda item: item[0])
+        return candidates[-1][1]
     raise WorkbookProcessError("目标模板中没有找到“配送学校：...”信息，请在页面里手动填写学校名称。")
 
 
@@ -875,11 +902,21 @@ def base_sheet_name(meal_type: str, year: int, month: int) -> str:
     return f"{year}年{month}月"
 
 
+def table_headers_match(values: list[Any]) -> bool:
+    if len(values) < len(TABLE_HEADER_ALIASES):
+        return False
+    for actual, aliases in zip(values, TABLE_HEADER_ALIASES):
+        normalized_aliases = {normalize_header_text(alias) for alias in aliases}
+        if normalize_header_text(actual) not in normalized_aliases:
+            return False
+    return True
+
+
 def find_table_layout(sheet: Worksheet) -> tuple[int, int, int]:
     header_row = None
     for row_idx in range(1, min(sheet.max_row or 1, 20) + 1):
-        values = [clean_text(sheet.cell(row_idx, col).value) for col in range(1, 9)]
-        if values[: len(TABLE_HEADERS)] == TABLE_HEADERS:
+        values = [sheet.cell(row_idx, col).value for col in range(1, 9)]
+        if table_headers_match(values):
             header_row = row_idx
             break
     if header_row is None:
